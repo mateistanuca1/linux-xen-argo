@@ -6,6 +6,9 @@
 #include <linux/net.h>
 #include <linux/netdevice.h>
 #include <linux/random.h>
+#include <xen/xen.h>
+#include <xen/interface/xen.h>
+
 
 #include <net/sock.h>
 #include <net/af_vsock.h>
@@ -128,17 +131,129 @@ static inline bool sockaddr_vm_match(const struct sockaddr_vm *src,
 /*
  * Connections.
  */
+
+static int argo_send_syn(struct vsock_sock *vsk)
+{
+	struct sk_buff *skb;
+	struct xen_argo_ring_message_header *hdr;
+	xen_argo_send_addr_t send = {
+		.dst.domain_id = vsk->remote_addr.svm_cid,
+		.dst.aport = vsk->remote_addr.svm_port,
+	};
+	skb = alloc_skb(sizeof (*hdr), GFP_KERNEL);
+	if (!skb)
+		return -ENOMEM;
+
+	hdr = (void*)skb_put(skb, sizeof (*hdr));
+	hdr->len = sizeof (*hdr);
+	hdr->source.domain_id = vsk->local_addr.svm_cid;
+	hdr->source.aport = vsk->local_addr.svm_port;
+	hdr->message_type = ARGO_MSG_SYN;
+	return argo_ring_send_skb(argo_trans(vsk)->h, skb, &send);
+}
+
+static int argo_wait_for_ack(struct vsock_sock *vsk)
+{
+	struct sk_buff *skb;
+	struct xen_argo_ring_message_header *hdr;
+	long timeout = msecs_to_jiffies(5000);
+	unsigned long start = jiffies;
+
+	while(time_before(jiffies, start + timeout)) {
+		skb = skb_recv_datagram(&vsk->sk, MSG_DONTWAIT, NULL);
+		if (!skb) {
+			msleep(20);
+			continue;
+		}
+
+		hdr = (struct xen_argo_ring_message_header *)skb->data;
+		if (!hdr) {
+			pr_debug("could not access sk_buff data to read message header, dropping packet.\n");
+			kfree_skb(skb);
+			continue;
+		}
+
+		if (hdr->message_type == ARGO_MSG_ACK) {
+			pr_debug("Received expected ACK from dom%u:%u\n",
+				hdr->source.domain_id, hdr->source.aport);
+			kfree_skb(skb);
+			return 0;
+		}
+
+		pr_debug("Received unexpected message type %u from dom%u:%u, dropping.\n",
+			hdr->message_type, hdr->source.domain_id, hdr->source.aport);
+		kfree_skb(skb);
+	}
+
+	return -ETIMEDOUT;
+}
+
+static int argo_transport_send_ack(struct vsock_sock *vsk)
+{
+    struct sk_buff *skb;
+    struct xen_argo_ring_message_header *hdr;
+    xen_argo_send_addr_t send = {
+        .dst.domain_id = vsk->remote_addr.svm_cid,
+        .dst.aport = vsk->remote_addr.svm_port,
+    };
+
+    skb = alloc_skb(sizeof(*hdr), GFP_KERNEL);
+    if (!skb)
+        return -ENOMEM;
+
+    hdr = (void*)skb_put(skb, sizeof(*hdr));
+    hdr->len = sizeof(*hdr);
+    hdr->source.domain_id = vsk->local_addr.svm_cid;
+    hdr->source.aport = vsk->local_addr.svm_port;
+    hdr->message_type = ARGO_MSG_ACK;
+
+    return argo_ring_send_skb(argo_trans(vsk)->h, skb, &send);
+}
+
+
 static int argo_transport_connect(struct vsock_sock *vsk)
 {
+
+	int rc;
+
+	struct sock *sk = &vsk->sk;
+
 	if (!vsock_addr_bound(&vsk->local_addr))
 		return -EINVAL;
 	if (!vsock_addr_bound(&vsk->remote_addr))
 		return -EINVAL;
 
+	if(sk->sk_type == SOCK_DGRAM) {
+		sk->sk_state = TCP_ESTABLISHED;
+		return 0;
+	}
+
+	rc = argo_send_syn(vsk);
+    if (rc < 0) {
+        pr_err("Failed to send SYN\n");
+        sk->sk_state = TCP_CLOSE;
+        return rc;
+    }
+
+	rc = argo_wait_for_ack(vsk);
+    if (rc < 0) {
+        pr_err("Timeout waiting for SYN-ACK\n");
+        sk->sk_state = TCP_CLOSE;
+        return rc;
+    }
+
+	rc = argo_transport_send_ack(vsk);
+    if (rc < 0) {
+        pr_err("Failed to send ACK\n");
+        sk->sk_state = TCP_CLOSE;
+        return rc;
+    }
+
 	/* TODO: STREAM will require SYN/ACK dance here.
 	 *	 DGRAM requires nothing right? */
 
-	return -ECONNREFUSED;
+	sk->sk_state = TCP_ESTABLISHED;
+	return 0;
 }
 
 /*
@@ -247,7 +362,7 @@ static int argo_transport_dgram_dequeue(struct vsock_sock *vsk,
 	size_t msg_len;
 	int rc = 0;
 
-	skb = skb_recv_datagram(&vsk->sk, flags, flags & MSG_DONTWAIT, &rc);
+	skb = skb_recv_datagram(&vsk->sk, flags & MSG_DONTWAIT, &rc);
 	if (!skb) {
 		pr_debug("skb_recv_datagram failed (%d).\n", rc);
 		goto out;
@@ -332,8 +447,68 @@ static bool argo_transport_stream_is_active(struct vsock_sock *vsk)
 
 static bool argo_transport_stream_allow(u32 cid, u32 port)
 {
-	/* TODO: Pre-filtering can be done in here. */
-	return false;
+	struct argo_ring_hnd *h = NULL;
+	struct sk_buff *skb;
+	struct xen_argo_ring_message_header *mh;
+	xen_argo_send_addr_t send = {
+		.dst.domain_id = cid,
+		.dst.aport = port,
+	};
+
+	read_lock(&argo_rings_lock);
+    list_for_each_entry(h, &argo_rings, l) {
+        if (h->partner_id == cid && h->aport == port)
+            break;
+    }
+
+	read_unlock(&argo_rings_lock);
+
+    if (!h || h->partner_id != cid || h->aport != port) {
+        pr_debug("No ring for dom%u:%u\n", cid, port);
+        return false;
+    }
+
+	skb = argo_ring_recv_skb(h);
+	if (IS_ERR(skb)) {
+		pr_debug("No data on ring for dom%u:%u\n", cid, port
+			, -PTR_ERR(skb));
+		return false;
+	}
+
+	mh = (struct xen_argo_ring_message_header *)skb->data;
+	if (mh->message_type != ARGO_MSG_SYN) {
+		pr_debug("Received unexpected message type %u from dom%u:%u, dropping.\n",
+			mh->message_type, mh->source.domain_id, mh->source.aport);
+		kfree_skb(skb);
+		return false;
+	}
+
+	kfree_skb(skb);
+
+
+	skb = alloc_skb(sizeof(*mh), GFP_KERNEL);
+    if (!skb) {
+        pr_debug("Failed to allocate skb for ACK\n");
+        return false;
+    }
+
+    mh = (struct xen_argo_ring_message_header *)skb_put(skb, sizeof(*mh));
+    mh->len = sizeof(*mh);
+    mh->source.domain_id = h->partner_id;  // sau cid-ul local?
+    mh->source.aport = port;               // port local?
+    mh->message_type = ARGO_MSG_ACK;
+
+    if (argo_ring_send_skb(h, skb, &send) < 0) {
+        pr_debug("Failed to send ACK to dom%u:%u\n", cid, port);
+        kfree_skb(skb);
+        return false;
+    }
+
+	kfree_skb(skb);
+    return true;
+
+
+
 }
 #endif /* TODO_STREAM */
 
@@ -441,38 +616,41 @@ static int argo_transport_shutdown(struct vsock_sock *vsk, int mode)
 /*
  * Buffer sizes.
  */
-static void argo_transport_set_buffer_size(struct vsock_sock *vsk, u64 val)
-{
-	/* TODO: Probably not usable in our case. */
-}
+// static void argo_transport_set_buffer_size(struct vsock_sock *vsk, u64 val)
+// {
+// 	/* TODO: Probably not usable in our case. */
+// }
 
-static void argo_transport_set_min_buffer_size(struct vsock_sock *vsk, u64 val)
-{
-}
+// static void argo_transport_set_min_buffer_size(struct vsock_sock *vsk, u64 val)
+// {
+// }
 
-static void argo_transport_set_max_buffer_size(struct vsock_sock *vsk, u64 val)
-{
-}
+// static void argo_transport_set_max_buffer_size(struct vsock_sock *vsk, u64 val)
+// {
+// }
 
-static u64 argo_transport_get_buffer_size(struct vsock_sock *vsk)
-{
-	return 0ULL;
-}
+// static u64 argo_transport_get_buffer_size(struct vsock_sock *vsk)
+// {
+// 	return 0ULL;
+// }
 
-static u64 argo_transport_get_min_buffer_size(struct vsock_sock *vsk)
-{
-	return 0ULL;
-}
+// static u64 argo_transport_get_min_buffer_size(struct vsock_sock *vsk)
+// {
+// 	return 0ULL;
+// }
 
-static u64 argo_transport_get_max_buffer_size(struct vsock_sock *vsk)
-{
-	return 0ULL;
-}
+// static u64 argo_transport_get_max_buffer_size(struct vsock_sock *vsk)
+// {
+// 	return 0ULL;
+// }
 
 static u32 argo_transport_get_local_cid(void)
 {
 	/* TODO: May require svm_cid format instead of Argo. */
-	return XEN_ARGO_DOMID_ANY;
+	// return XEN_ARGO_DOMID_ANY;
+	return xen_domain();
+
+
 }
 
 static struct vsock_transport argo_transport = {
@@ -509,29 +687,30 @@ static struct vsock_transport argo_transport = {
 
 	.shutdown = argo_transport_shutdown,
 
-	.set_buffer_size = argo_transport_set_buffer_size,
-	.set_min_buffer_size = argo_transport_set_min_buffer_size,
-	.set_max_buffer_size = argo_transport_set_max_buffer_size,
-	.get_buffer_size = argo_transport_get_buffer_size,
-	.get_min_buffer_size = argo_transport_get_min_buffer_size,
-	.get_max_buffer_size = argo_transport_get_max_buffer_size,
+	// .set_buffer_size = argo_transport_set_buffer_size,
+	// .set_min_buffer_size = argo_transport_set_min_buffer_size,
+	// .set_max_buffer_size = argo_transport_set_max_buffer_size,
+	// .get_buffer_size = argo_transport_get_buffer_size,
+	// .get_min_buffer_size = argo_transport_get_min_buffer_size,
+	// .get_max_buffer_size = argo_transport_get_max_buffer_size,
 
 	.get_local_cid = argo_transport_get_local_cid,
 };
+
 
 static int __init argo_transport_init(void)
 {
 	int rc;
 
-	rc = vsock_core_init(&argo_transport);
+	rc = vsock_core_register(&argo_transport, VSOCK_TRANSPORT_F_DGRAM);
 	if (rc) {
 		pr_err("vsock_core_init() failed (%d).\n", rc);
-		return rc;
+
 	}
 	rc = argo_core_init();
 	if (rc) {
 		pr_err("argo_core_init() failed (%d).\n", rc);
-		vsock_core_exit();
+		vsock_core_unregister(&argo_transport);
 		return rc;
 	}
 	pr_info("vsock_argo_transport registered.\n");
@@ -546,7 +725,7 @@ static void __exit argo_transport_exit(void)
 
 	pr_info("vsock_argo_transport unregistered.\n");
 	argo_core_cleanup();
-	vsock_core_exit();
+	vsock_core_unregister(&argo_transport);
 	return;
 }
 module_exit(argo_transport_exit);

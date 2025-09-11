@@ -330,7 +330,7 @@ int argo_ring_send_skb(struct argo_ring_hnd *h, const struct sk_buff *skb,
 /*
  * Tasklet handling packets reception.
  */
-static void argo_handle_event(unsigned long data)
+static void argo_handle_event(struct tasklet_struct *t)
 {
 	struct argo_ring_hnd *h, *tmp;
 	int rc;
@@ -358,7 +358,7 @@ static void argo_handle_event(unsigned long data)
 	read_unlock(&argo_rings_lock);
 }
 
-DECLARE_TASKLET(argo_event, argo_handle_event, 0);
+DECLARE_TASKLET(argo_event, argo_handle_event);
 
 /*
  * IRQ handler scheduling tasklet.

@@ -59,6 +59,12 @@ typedef uint64_t xen_argo_gfn_t;
 DEFINE_XEN_GUEST_HANDLE(uint8_t);
 #endif
 
+#define ARGO_MSG_SYN   1
+#define ARGO_MSG_ACK   2
+#define ARGO_MSG_DATA  3
+#define ARGO_MSG_FIN   4
+
+
 typedef struct xen_argo_iov
 {
 #ifdef XEN_GUEST_HANDLE_64

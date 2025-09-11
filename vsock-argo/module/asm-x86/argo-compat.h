@@ -6,6 +6,10 @@
 #ifndef HYPERVISOR_argo_op
 #define __HYPERVISOR_argo_op	39
 
+#ifndef argo_op
+#define argo_op __HYPERVISOR_argo_op
+#endif
+
 #ifndef _hypercall5
 /*
  * Removed because unused in:

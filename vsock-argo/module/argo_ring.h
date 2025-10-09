@@ -60,6 +60,7 @@ struct argo_ring_hnd *argo_ring_handle_alloc(domid_t domain, unsigned int port,
  */
 void argo_ring_unregister(struct argo_ring_hnd *h);
 int argo_ring_register(struct argo_ring_hnd *h);
+bool argo_ring_exists(domid_t domain, unsigned int port);
 
 /*
  * Ring "send" primitive. send is synchronous, direct hypercall to Xen.

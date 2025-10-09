@@ -188,6 +188,23 @@ int argo_ring_register(struct argo_ring_hnd *h)
 	return rc;
 }
 
+bool argo_ring_exists(domid_t domain, unsigned int port)
+{
+	struct argo_ring_hnd *h;
+	bool found = false;
+
+	read_lock(&argo_rings_lock);
+	list_for_each_entry(h, &argo_rings, l) {
+		if (h->partner_id == domain && h->aport == port) {
+			found = true;
+			break;
+		}
+	}
+	read_unlock(&argo_rings_lock);
+
+	return found;
+}
+
 /*
  * Ring arithmetic helpers.
  * Argo ring never fill up completely, so tx == rx means the ring is empty.

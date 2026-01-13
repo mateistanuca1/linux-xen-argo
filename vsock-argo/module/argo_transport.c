@@ -134,6 +134,7 @@ static inline bool sockaddr_vm_match(const struct sockaddr_vm *src,
  */
 
 static int argo_transport_stream_recv_cb(void *priv, struct sk_buff *skb);
+static int argo_transport_stream_connect_recv_cb(void *priv, struct sk_buff *skb);
 
 static int argo_transport_stream_bind(struct vsock_sock *vsk, struct sockaddr_vm *addr) {
 	printk(KERN_INFO "argo_transport_stream_bind called");
@@ -145,7 +146,7 @@ static int argo_transport_stream_bind(struct vsock_sock *vsk, struct sockaddr_vm
 	memcpy(&vsk->local_addr, addr, sizeof (*addr));
 
 	t->h = argo_ring_handle_alloc(addr->svm_cid, addr->svm_port,
-		argo_transport_stream_recv_cb, vsk);
+		argo_transport_stream_connect_recv_cb, vsk);
 	if (IS_ERR(t->h)) {
 		rc = PTR_ERR(t->h);
 		return rc;
@@ -157,6 +158,60 @@ static int argo_transport_stream_bind(struct vsock_sock *vsk, struct sockaddr_vm
 		return rc;
 	}
 	return 0;
+}
+
+static int argo_transport_stream_connect_recv_cb(void *priv, struct sk_buff *skb) {
+	struct vsock_sock *vsk = priv;
+	struct sock *sk = &vsk->sk;
+	int rc;
+	printk(KERN_INFO "ARGO: connect_recv_cb CALLED. Skb len: %u", skb->len);
+	struct xen_argo_ring_message_header *hdr;
+	hdr = (struct xen_argo_ring_message_header *)skb->data;
+	printk(KERN_INFO "ARGO DEBUG: Type received: 0x%x (%u) | Expected: 0x%x (%u)", 
+           hdr->message_type, hdr->message_type, 
+           XEN_ARGO_SEND_SYN, XEN_ARGO_SEND_SYN);
+
+    // Afișăm sursa pentru a verifica dacă headerul e aliniat corect
+    printk(KERN_INFO "ARGO DEBUG: Source DOM: %u, Port: %u", 
+           hdr->source.domain_id, hdr->source.aport);
+
+    // HEX DUMP: Vedem primii 32 de octeți din pachet. 
+    // Asta ne va arăta dacă datele sunt decalate.
+    print_hex_dump(KERN_INFO, "ARGO DATA: ", DUMP_PREFIX_OFFSET, 
+                   16, 1, skb->data, min(skb->len, 32u), true);
+    // --- DEBUG END ---
+	if (hdr->message_type == XEN_ARGO_SEND_SYN) {
+		printk(KERN_INFO "Received SYN from dom%u:%u", hdr->source.domain_id, hdr->source.aport);
+		if(sk_acceptq_is_full(sk)) {
+			return -ENOMEM;
+		}
+		if (sk->sk_shutdown == SHUTDOWN_MASK) {
+			return -ESHUTDOWN;
+		}
+		struct sock *child;
+		child = vsock_create_connected(sk);
+		if(!child) {
+			return -ENOMEM;
+		}
+		printk(KERN_INFO "Created child socket for dom%u:%u", hdr->source.domain_id, hdr->source.aport);
+		sk_acceptq_added(sk);
+		lock_sock_nested(sk, SINGLE_DEPTH_NESTING);
+		child->sk_state = TCP_ESTABLISHED;
+		struct vsock_sock *child_vsk = vsock_sk(child);
+		vsock_addr_init(&child_vsk->local_addr,
+            vsk->local_addr.svm_cid, 
+            vsk->local_addr.svm_port);
+		vsock_addr_init(&child_vsk->remote_addr,
+			hdr->source.domain_id, hdr->source.aport);
+		rc = vsock_assign_transport(child_vsk, vsk);
+
+		printk(KERN_INFO "Created child socket");
+		
+
+	}
+
+	return 0;
+
 }
 
 static int argo_transport_stream_recv_cb(void *priv, struct sk_buff *skb) {
@@ -227,9 +282,30 @@ static int argo_transport_connect(struct vsock_sock *vsk)
 	printk(KERN_INFO "ring success");
 
 	//Sending SYN
+	struct sk_buff *skb;
+	skb = alloc_skb(sizeof(struct xen_argo_ring_message_header), GFP_ATOMIC);
+	if (!skb) {
+		pr_debug("%s: alloc_skb failed.\n", __func__);
+		return -ENOMEM;
+	}
 
+	printk(KERN_INFO "SYN preparing to send");
 
-	
+	// Fill in the SYN packet header
+	struct xen_argo_ring_message_header *hdr = skb_put(skb, sizeof(*hdr));
+	hdr->message_type = XEN_ARGO_SEND_SYN;
+	hdr->source = sendaddr.src;
+	hdr->len = sizeof(*hdr);
+
+	printk(KERN_INFO "SYN prepared, sending");
+
+	rc = argo_ring_send_skb(t->h, skb, &sendaddr);
+	if (rc < 0) {
+		printk(KERN_INFO "argo_ring_send_skb failed");
+		kfree_skb(skb);
+		return rc;
+	}
+	printk(KERN_INFO "SYN sent successfully");
 
 
 	sk->sk_state = TCP_ESTABLISHED;
